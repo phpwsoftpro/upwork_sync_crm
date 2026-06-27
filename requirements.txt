@@ -1,0 +1,5 @@
+pyautogui
+python-dotenv
+Pillow
+pyobjc-core
+pyobjc-framework-Quartz

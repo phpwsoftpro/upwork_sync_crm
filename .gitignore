@@ -1,0 +1,26 @@
+# Dependencies
+venv/
+__pycache__/
+*.pyc
+
+# Sensitive data
+.env
+upwork_cookies.json
+crm_cookies.json
+
+# Debug/temp files
+debug_*.html
+debug_*.png
+crm_page.html
+chrome_cdp_profile/
+upwork_pyautogui_session/
+
+# Scraped data (large JSON)
+upwork_jobs_*.json
+synced_jobs.json
+
+# Logs
+logs/
+
+# macOS
+.DS_Store
