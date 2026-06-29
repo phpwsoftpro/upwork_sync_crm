@@ -214,15 +214,23 @@ class ChromeCDP:
         chrome_path = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
         profile = os.path.join(SCRIPT_DIR, 'chrome_cdp_profile')
 
-        # Kill any existing on this port
+        # Kill any existing Chrome on this port
         try:
-            subprocess.run(['pkill', '-f', f'--remote-debugging-port={self.port}'],
+            subprocess.run(['pkill', '-f', f'remote-debugging-port={self.port}'],
+                           capture_output=True, timeout=3)
+            time.sleep(2)
+        except:
+            pass
+
+        # Also kill any Chrome using our profile
+        try:
+            subprocess.run(['pkill', '-f', 'chrome_cdp_profile'],
                            capture_output=True, timeout=3)
             time.sleep(1)
         except:
             pass
 
-        self.chrome_proc = subprocess.Popen([
+        cmd = [
             chrome_path,
             f'--remote-debugging-port={self.port}',
             f'--user-data-dir={profile}',
@@ -232,19 +240,33 @@ class ChromeCDP:
             '--disable-extensions',
             '--no-first-run',
             '--no-default-browser-check',
+            '--disable-background-networking',
             'about:blank'
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(4)
+        ]
+        log.info(f"  🚀 Launching Chrome on port {self.port}...")
+        self.chrome_proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        time.sleep(8)
         log.info(f"  🌐 Chrome launched (PID: {self.chrome_proc.pid})")
 
     def connect(self):
-        """Connect to Chrome via WebSocket."""
+        """Connect to Chrome via WebSocket with retry."""
         import websocket
-        targets = json.loads(urllib.request.urlopen(
-            f'http://127.0.0.1:{self.port}/json', timeout=5).read())
-        ws_url = [t for t in targets if t.get('type') == 'page'][0]['webSocketDebuggerUrl']
-        self.ws = websocket.create_connection(ws_url, timeout=30)
-        log.info("  🔗 CDP connected")
+        for attempt in range(5):
+            try:
+                targets = json.loads(urllib.request.urlopen(
+                    f'http://127.0.0.1:{self.port}/json', timeout=5).read())
+                ws_url = [t for t in targets if t.get('type') == 'page'][0]['webSocketDebuggerUrl']
+                self.ws = websocket.create_connection(ws_url, timeout=30)
+                log.info("  🔗 CDP connected")
+                return
+            except Exception as e:
+                if attempt < 4:
+                    log.info(f"  ⏳ Waiting for Chrome... (attempt {attempt+1}/5)")
+                    time.sleep(3)
+                else:
+                    raise ConnectionError(f"Cannot connect to Chrome on port {self.port}: {e}")
 
     def cdp(self, method, params=None, timeout=15):
         """Send CDP command and wait for response."""
@@ -328,7 +350,7 @@ def submit_proposal_via_cdp(chrome, ciphertext, cover_letter, bid_rate=None):
     apply_url = f'https://www.upwork.com/nx/proposals/job/{ciphertext}/apply/'
     log.info(f"  📝 Navigating to apply page...")
     
-    current_url = chrome.navigate(apply_url, wait=6)
+    current_url = chrome.navigate(apply_url, wait=8)
     log.info(f"  📍 URL: {current_url[:80]}")
 
     # Check if we're on the apply page
@@ -339,115 +361,98 @@ def submit_proposal_via_cdp(chrome, ciphertext, cover_letter, bid_rate=None):
         return False, f"Unexpected page: {current_url}"
 
     # Check for "Already Applied" or other blockers
-    page_text = chrome.evaluate('document.body.innerText.substring(0, 2000)') or ''
+    page_text = chrome.evaluate('document.body.innerText.substring(0, 3000)') or ''
     if 'already submitted' in page_text.lower() or 'already applied' in page_text.lower():
         return False, "Already submitted a proposal for this job"
     
     if 'not enough connects' in page_text.lower():
         return False, "Not enough Upwork Connects"
 
-    # Wait for form to fully load
-    time.sleep(3)
+    # Wait for SPA form to fully render
+    time.sleep(5)
 
-    # Fill cover letter
+    # ── Step 1: Fill bid rate FIRST (input#step-rate) ──
+    if bid_rate:
+        log.info(f"  💰 Setting bid rate: ${bid_rate}/hr...")
+        rate_result = chrome.evaluate(f'''
+        (function() {{
+            var el = document.getElementById("step-rate");
+            if (!el) return "NO_RATE_INPUT";
+            el.focus();
+            el.select();
+            var setter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, "value"
+            ).set;
+            setter.call(el, "{bid_rate}");
+            el.dispatchEvent(new Event("input", {{ bubbles: true }}));
+            el.dispatchEvent(new Event("change", {{ bubbles: true }}));
+            el.dispatchEvent(new Event("blur", {{ bubbles: true }}));
+            return "OK:" + el.value;
+        }})()
+        ''')
+        log.info(f"  💰 Rate result: {rate_result}")
+    
+    time.sleep(1)
+
+    # ── Step 2: Fill cover letter (single visible textarea) ──
     log.info(f"  ✍️  Filling cover letter ({len(cover_letter)} chars)...")
-    escaped_letter = cover_letter.replace('\\', '\\\\').replace('`', '\\`').replace('$', '\\$').replace("'", "\\'").replace('"', '\\"')
+    
+    # Use JSON.parse to safely inject the cover letter text
+    import base64
+    b64_letter = base64.b64encode(cover_letter.encode()).decode()
     
     fill_result = chrome.evaluate(f'''
     (function() {{
-        // Try multiple selectors for the cover letter field
-        var selectors = [
-            'textarea[data-test="coverLetter"]',
-            'textarea[name="coverLetter"]',
-            'textarea#cover-letter',
-            'textarea.cover-letter',
-            '[data-cy="coverLetter"] textarea',
-            'textarea',
-        ];
-        var textarea = null;
-        for (var i = 0; i < selectors.length; i++) {{
-            var el = document.querySelector(selectors[i]);
-            if (el && (el.offsetParent !== null || el.offsetHeight > 0)) {{
-                textarea = el;
-                break;
-            }}
-        }}
+        var textarea = document.querySelector("textarea");
         if (!textarea) return "NO_TEXTAREA";
         
-        // Set value using React-compatible method
+        textarea.focus();
+        textarea.click();
+        
+        // Decode the base64-encoded cover letter
+        var text = atob("{b64_letter}");
+        
+        // Set value using React-compatible native setter
         var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
             window.HTMLTextAreaElement.prototype, "value"
         ).set;
-        nativeInputValueSetter.call(textarea, "{escaped_letter}");
+        nativeInputValueSetter.call(textarea, text);
         textarea.dispatchEvent(new Event("input", {{ bubbles: true }}));
         textarea.dispatchEvent(new Event("change", {{ bubbles: true }}));
+        textarea.dispatchEvent(new Event("blur", {{ bubbles: true }}));
         return "OK:" + textarea.value.length;
     }})()
     ''')
-    log.info(f"  📋 Cover letter fill result: {fill_result}")
+    log.info(f"  📋 Cover letter result: {fill_result}")
     
     if fill_result == 'NO_TEXTAREA':
         return False, "Could not find cover letter textarea"
 
-    # Fill bid rate if provided
-    if bid_rate:
-        log.info(f"  💰 Setting bid rate: ${bid_rate}/hr...")
-        chrome.evaluate(f'''
-        (function() {{
-            var inputs = document.querySelectorAll('input[type="text"], input[type="number"]');
-            for (var i = 0; i < inputs.length; i++) {{
-                var el = inputs[i];
-                var label = (el.getAttribute("aria-label") || "").toLowerCase();
-                var name = (el.getAttribute("name") || "").toLowerCase();
-                var placeholder = (el.getAttribute("placeholder") || "").toLowerCase();
-                if (label.includes("rate") || label.includes("bid") || label.includes("amount") ||
-                    name.includes("rate") || name.includes("amount") || name.includes("bid") ||
-                    placeholder.includes("rate") || placeholder.includes("bid")) {{
-                    var setter = Object.getOwnPropertyDescriptor(
-                        window.HTMLInputElement.prototype, "value"
-                    ).set;
-                    setter.call(el, "{bid_rate}");
-                    el.dispatchEvent(new Event("input", {{ bubbles: true }}));
-                    el.dispatchEvent(new Event("change", {{ bubbles: true }}));
-                    return "OK";
-                }}
-            }}
-            return "NO_RATE_INPUT";
-        }})()
-        ''')
-
     # Small pause before submit
-    time.sleep(2)
+    time.sleep(3)
 
-    # Click submit button
-    log.info("  🚀 Clicking Submit...")
+    # ── Step 3: Click "Send for X Connects" button ──
+    log.info("  🚀 Clicking Send...")
     submit_result = chrome.evaluate('''
     (function() {
-        var selectors = [
-            'button[data-test="submit-proposal"]',
-            'button[data-cy="submit-proposal"]',
-            'button.submit-proposal',
-            'button[type="submit"]',
-        ];
-        // Also try buttons by text content
         var buttons = document.querySelectorAll("button");
+        for (var i = 0; i < buttons.length; i++) {
+            var txt = buttons[i].innerText.toLowerCase().trim();
+            if (txt.includes("send for") && txt.includes("connects")) {
+                buttons[i].click();
+                return "CLICKED:" + buttons[i].innerText.trim();
+            }
+        }
+        // Fallback: try other submit patterns
         for (var i = 0; i < buttons.length; i++) {
             var txt = buttons[i].innerText.toLowerCase().trim();
             if (txt.includes("submit") && txt.includes("proposal")) {
                 buttons[i].click();
-                return "CLICKED:" + txt;
+                return "CLICKED:" + buttons[i].innerText.trim();
             }
-            if (txt === "submit" || txt === "send proposal") {
+            if (txt === "send" || txt === "submit") {
                 buttons[i].click();
-                return "CLICKED:" + txt;
-            }
-        }
-        // Try data-test selectors
-        for (var j = 0; j < selectors.length; j++) {
-            var btn = document.querySelector(selectors[j]);
-            if (btn) {
-                btn.click();
-                return "CLICKED:" + btn.innerText;
+                return "CLICKED:" + buttons[i].innerText.trim();
             }
         }
         return "NO_SUBMIT_BUTTON";
@@ -573,13 +578,13 @@ def main():
     log.info(f"\n🌐 Launching Chrome for {len(valid)} proposal(s)...")
     chrome = ChromeCDP(port=9234)
     
+    submitted = 0
+    failed = 0
+
     try:
         chrome.launch()
         chrome.connect()
         chrome.load_cookies()
-
-        submitted = 0
-        failed = 0
 
         for p in valid:
             log.info(f"\n{'─' * 50}")
