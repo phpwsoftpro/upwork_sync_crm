@@ -365,6 +365,7 @@ def main():
     parser.add_argument('--wait-captcha', type=int, default=45, help='Seconds to wait for captcha (default: 45)')
     parser.add_argument('--env', default=None, help='Path to .env file')
     parser.add_argument('--profile', default=None, help='Chrome profile directory')
+    parser.add_argument('--login-only', action='store_true', help='Login only, skip auto-sync (used by auto_sync.py)')
 
     args = parser.parse_args()
 
@@ -383,16 +384,37 @@ def main():
     except KeyboardInterrupt:
         log.info("\n🛑 Cancelled by user.")
         success = False
-    finally:
-        # Don't kill Chrome — let user keep using it
-        log.info("=" * 55)
-        if success:
-            log.info("  ✅ Login completed! Chrome remains open.")
-        else:
-            log.info("  ⚠️  Check Chrome window for manual steps.")
-        log.info("=" * 55)
 
-    sys.exit(0 if success else 1)
+    # Close Chrome after login (free resources, no conflict)
+    log.info("=" * 55)
+    if success:
+        log.info("  ✅ Login completed! Closing Chrome...")
+        try:
+            chrome_proc.terminate()
+            chrome_proc.wait(timeout=5)
+        except:
+            try: chrome_proc.kill()
+            except: pass
+        log.info("  🔒 Chrome closed.")
+
+        # Auto-run sync (unless --login-only)
+        if args.login_only:
+            log.info("  ✅ Login-only mode. Exiting.")
+            log.info("=" * 55)
+            sys.exit(0)
+
+        log.info("  🔄 Starting auto sync to CRM...")
+        log.info("=" * 55)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        venv_python = os.path.join(script_dir, 'venv', 'bin', 'python3')
+        python_cmd = venv_python if os.path.exists(venv_python) else sys.executable
+        sync_script = os.path.join(script_dir, 'auto_sync.py')
+
+        os.execv(python_cmd, [python_cmd, sync_script, '--count', '200'])
+    else:
+        log.info("  ⚠️  Check Chrome window for manual steps.")
+        log.info("=" * 55)
+        sys.exit(1)
 
 
 if __name__ == '__main__':

@@ -2,12 +2,12 @@
 """
 Upwork → CRM Auto Sync
 =======================
-Scrapes latest IT jobs from Upwork and syncs new ones to Odoo CRM.
+Scrapes latest jobs from ALL Upwork categories and syncs new ones to Odoo CRM.
 Designed to run every 20 minutes via macOS launchd.
 
 Usage:
-    python3 auto_sync.py                    # Default: IT jobs
-    python3 auto_sync.py --query "Python"   # Custom search
+    python3 auto_sync.py                    # All categories, 100 jobs
+    python3 auto_sync.py --count 200        # Get 200 jobs
     python3 auto_sync.py --dry-run          # Preview only, no CRM write
 """
 
@@ -151,8 +151,14 @@ def extract_jobs_from_nuxt(html):
     body = match.group(2)
 
     all_jobs = []
-    for section in ['feedBestMatch', 'feedMostRecent', 'searchResults']:
-        feed = re.search(rf'{section}:\{{jobs:\[(.*?)\],paging:', body, re.DOTALL)
+    # Feed pages use: feedBestMatch:{jobs:[...],paging:
+    # Search pages use: jobsSearch:{status:{...},jobs:[...],paging:
+    for section in ['feedBestMatch', 'feedMostRecent', 'searchResults', 'jobsSearch']:
+        # Flexible: match jobs:[ after any nested objects within the section
+        feed = re.search(rf'{section}:\{{[^{{]*?jobs:\[(.*?)\],paging:', body, re.DOTALL)
+        if not feed:
+            # Try alternate pattern with nested status object
+            feed = re.search(rf'{section}:\{{[^[]*?jobs:\[(.*?)\],(paging|total)', body, re.DOTALL)
         if not feed:
             continue
         job_objs = _split_objects(feed.group(1))
@@ -253,30 +259,101 @@ def _format_job(raw):
     }
 
 
-def scrape_upwork(cookie_str, query='IT'):
+# All-category search queries to cover every Upwork category
+CATEGORY_QUERIES = [
+    # Development & IT
+    'web development', 'mobile app development', 'software development',
+    'python developer', 'javascript developer', 'react developer',
+    'full stack developer', 'backend developer', 'frontend developer',
+    'wordpress developer', 'shopify developer', 'flutter developer',
+    'node.js developer', 'PHP developer', 'devops engineer',
+    # AI & Automation
+    'artificial intelligence', 'machine learning', 'chatbot development',
+    'AI automation', 'prompt engineering', 'data science',
+    # Design & Creative
+    'UI UX design', 'graphic design', 'logo design',
+    'web design', 'figma designer',
+    # Marketing
+    'digital marketing', 'SEO specialist', 'social media marketing',
+    'content marketing', 'email marketing',
+    # Writing & Content
+    'content writing', 'copywriting', 'technical writing',
+    # Video & Audio
+    'video editing', 'animation',
+    # Admin & Support
+    'virtual assistant', 'data entry', 'customer support',
+]
+
+
+def scrape_upwork(cookie_str, target_count=100):
     all_jobs = []
-    seen = set()
-    urls = [
-        ('Best Matches', 'https://www.upwork.com/nx/find-work/best-matches'),
-        ('Most Recent', 'https://www.upwork.com/nx/find-work/most-recent'),
-    ]
-    for label, url in urls:
-        log.info(f"  📄 Fetching {label}...")
+    seen = set()  # Track by ciphertext for exact dedup
+    seen_titles = set()  # Fallback dedup by title
+
+    def _add_jobs(jobs, label):
+        added = 0
+        for j in jobs:
+            key = j.get('ciphertext') or j['title']
+            if key not in seen and j['title'] not in seen_titles:
+                seen.add(key)
+                seen_titles.add(j['title'])
+                all_jobs.append(j)
+                added += 1
+        log.info(f"  ✅ {label}: {len(jobs)} found, {added} new (total: {len(all_jobs)})")
+
+    def _fetch_and_parse(url, label):
         html = fetch_page(cookie_str, url)
         if not html:
-            continue
+            return False
         if 'account-security/login' in html[:3000]:
             log.error("❌ Upwork session expired! Run login_cdp.py to re-login.")
-            return None  # Signal session expired
+            return None  # Signal expired
         if 'Verify you are human' in html[:3000]:
             log.warning(f"  ⚠️  Cloudflare on {label}, skipping")
-            continue
+            return False
         jobs = extract_jobs_from_nuxt(html)
-        for j in jobs:
-            if j['title'] not in seen:
-                seen.add(j['title'])
-                all_jobs.append(j)
-        log.info(f"  ✅ {label}: {len(jobs)} jobs (total unique: {len(all_jobs)})")
+        _add_jobs(jobs, label)
+        return True
+
+    # ── Phase 1: Default feeds (Best Matches + Most Recent) ──
+    log.info("📡 Phase 1: Fetching default feed pages...")
+    for label, url in [
+        ('Best Matches', 'https://www.upwork.com/nx/find-work/best-matches'),
+        ('Most Recent', 'https://www.upwork.com/nx/find-work/most-recent'),
+    ]:
+        result = _fetch_and_parse(url, label)
+        if result is None:
+            return None
+
+    # ── Phase 2: All 12 Upwork categories (pure HTTP, no Chrome!) ──
+    UPWORK_CATEGORIES = {
+        'Web, Mobile & Software Dev': '531770282580668416',
+        'IT & Networking':            '531770282580668417',
+        'Data Science & Analytics':   '531770282580668418',
+        'Engineering & Architecture': '531770282580668419',
+        'Design & Creative':          '531770282580668420',
+        'Writing':                    '531770282580668421',
+        'Translation':                '531770282580668422',
+        'Legal':                      '531770282580668423',
+        'Admin Support':              '531770282580668424',
+        'Customer Service':           '531770282580668425',
+        'Sales & Marketing':          '531770282580668426',
+        'Accounting & Consulting':    '531770282580668427',
+    }
+
+    if len(all_jobs) < target_count:
+        log.info(f"📡 Phase 2: Fetching all {len(UPWORK_CATEGORIES)} categories...")
+        for cat_name, cat_uid in UPWORK_CATEGORIES.items():
+            if len(all_jobs) >= target_count:
+                log.info(f"  🎯 Reached target of {target_count}!")
+                break
+            url = f'https://www.upwork.com/nx/find-work/best-matches?subcategory2_uid={cat_uid}'
+            result = _fetch_and_parse(url, cat_name)
+            if result is None:
+                return None
+            time.sleep(0.5)  # Be nice to Upwork
+
+    log.info(f"📊 Total unique jobs scraped: {len(all_jobs)}")
     return all_jobs
 
 
@@ -428,29 +505,76 @@ def save_synced(synced_set):
         json.dump(list(synced_set), f)
 
 
+def _relogin_and_reload():
+    """Run login_cdp.py --login-only to refresh cookies, then reload them."""
+    login_script = os.path.join(SCRIPT_DIR, 'login_cdp.py')
+    venv_python = os.path.join(SCRIPT_DIR, 'venv', 'bin', 'python3')
+    python_cmd = venv_python if os.path.exists(venv_python) else sys.executable
+
+    if not os.path.exists(login_script):
+        log.error(f"❌ login_cdp.py not found at {login_script}")
+        return None
+
+    log.info("🔐 Running login_cdp.py --login-only ...")
+    try:
+        import subprocess
+        result = subprocess.run(
+            [python_cmd, login_script, '--login-only'],
+            cwd=SCRIPT_DIR, timeout=120,
+            capture_output=False  # Show output in real-time
+        )
+        if result.returncode != 0:
+            log.error(f"❌ Login failed (exit code: {result.returncode})")
+            return None
+    except subprocess.TimeoutExpired:
+        log.error("❌ Login timed out (120s)")
+        return None
+    except Exception as e:
+        log.error(f"❌ Login error: {e}")
+        return None
+
+    # Reload fresh cookies
+    log.info("🍪 Reloading fresh cookies...")
+    return load_upwork_cookies()
+
+
 def main():
     parser = argparse.ArgumentParser(description='🔄 Upwork → CRM Auto Sync')
-    parser.add_argument('--query', default='IT', help='Search query (default: IT)')
+    parser.add_argument('--count', type=int, default=100, help='Target number of jobs (default: 100)')
     parser.add_argument('--dry-run', action='store_true', help='Preview only, no CRM write')
     args = parser.parse_args()
 
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     log.info("=" * 60)
     log.info(f"  🔄 UPWORK → CRM AUTO SYNC")
-    log.info(f"  📅 {ts} | Query: '{args.query}'")
+    log.info(f"  📅 {ts} | Target: {args.count} jobs | All categories")
     log.info("=" * 60)
 
     # Step 1: Load cookies
     cookie_str = load_upwork_cookies()
     if not cookie_str:
-        sys.exit(1)
+        log.warning("⚠️  No cookies found. Triggering login...")
+        cookie_str = _relogin_and_reload()
+        if not cookie_str:
+            sys.exit(1)
 
-    # Step 2: Scrape Upwork
-    log.info("📡 Scraping Upwork...")
-    jobs = scrape_upwork(cookie_str, args.query)
+    # Step 2: Scrape Upwork (all categories)
+    log.info("📡 Scraping Upwork (all categories)...")
+    jobs = scrape_upwork(cookie_str, target_count=args.count)
+
+    # Auto-relogin if session expired
     if jobs is None:
-        log.error("❌ Session expired. Please run login_cdp.py manually.")
-        sys.exit(1)
+        log.warning("🔄 Session expired — auto re-login...")
+        cookie_str = _relogin_and_reload()
+        if not cookie_str:
+            log.error("❌ Re-login failed. Exiting.")
+            sys.exit(1)
+        log.info("📡 Retrying scrape with fresh cookies...")
+        jobs = scrape_upwork(cookie_str, target_count=args.count)
+        if jobs is None:
+            log.error("❌ Still expired after re-login. Check Upwork account.")
+            sys.exit(1)
+
     if not jobs:
         log.info("📭 No jobs found this round.")
         return

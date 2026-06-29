@@ -1,26 +1,24 @@
-# Dependencies
+# Chrome profiles (large, sensitive)
+chrome_cdp_profile/
+chrome_scraper_profile/
+chrome_headless_profile/
+upwork_pyautogui_session/
+
+# Python
 venv/
 __pycache__/
 *.pyc
 
-# Sensitive data
-.env
+# Sensitive/runtime data
 upwork_cookies.json
-crm_cookies.json
+synced_jobs.json
+.env
+*.log
 
 # Debug/temp files
+crm_cookies.json
+crm_page.html
 debug_*.html
 debug_*.png
-crm_page.html
-chrome_cdp_profile/
-upwork_pyautogui_session/
-
-# Scraped data (large JSON)
 upwork_jobs_*.json
-synced_jobs.json
-
-# Logs
-logs/
-
-# macOS
-.DS_Store
+*.plist
