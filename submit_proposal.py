@@ -325,6 +325,33 @@ class ChromeCDP:
         }, timeout=timeout)
         return result.get('result', {}).get('value')
 
+    def focus_element(self, selector):
+        """Focus a DOM element by CSS selector using JS."""
+        result = self.evaluate(f'''
+        (function() {{
+            var el = document.querySelector("{selector}");
+            if (!el) return false;
+            el.focus();
+            el.click();
+            return true;
+        }})()
+        ''')
+        return result == True
+
+    def select_all(self):
+        """Send Cmd+A to select all text in focused element."""
+        self.cdp('Input.dispatchKeyEvent', {
+            'type': 'keyDown', 'key': 'a', 'code': 'KeyA',
+            'modifiers': 4  # Meta/Cmd
+        })
+        self.cdp('Input.dispatchKeyEvent', {
+            'type': 'keyUp', 'key': 'a', 'code': 'KeyA'
+        })
+
+    def insert_text(self, text):
+        """Insert text using CDP Input.insertText — works with React."""
+        self.cdp('Input.insertText', {'text': text})
+
     def close(self):
         """Close Chrome and WebSocket."""
         try:
@@ -368,68 +395,52 @@ def submit_proposal_via_cdp(chrome, ciphertext, cover_letter, bid_rate=None):
     if 'not enough connects' in page_text.lower():
         return False, "Not enough Upwork Connects"
 
+    if 'error 403' in page_text.lower() or 'unexpected error' in page_text.lower():
+        return False, "Error 403 — job may be closed or already applied"
+
+    if page_text.strip().count('\n') < 10 and 'textarea' not in page_text.lower():
+        # Page didn't load properly, likely blocked
+        return False, f"Page didn't load correctly"
+
     # Wait for SPA form to fully render
     time.sleep(5)
 
-    # ── Step 1: Fill bid rate FIRST (input#step-rate) ──
+    # ── Step 1: Fill bid rate (input#step-rate) using CDP Input ──
     if bid_rate:
         log.info(f"  💰 Setting bid rate: ${bid_rate}/hr...")
-        rate_result = chrome.evaluate(f'''
-        (function() {{
-            var el = document.getElementById("step-rate");
-            if (!el) return "NO_RATE_INPUT";
-            el.focus();
-            el.select();
-            var setter = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype, "value"
-            ).set;
-            setter.call(el, "{bid_rate}");
-            el.dispatchEvent(new Event("input", {{ bubbles: true }}));
-            el.dispatchEvent(new Event("change", {{ bubbles: true }}));
-            el.dispatchEvent(new Event("blur", {{ bubbles: true }}));
-            return "OK:" + el.value;
-        }})()
-        ''')
-        log.info(f"  💰 Rate result: {rate_result}")
+        bid_str = str(int(float(bid_rate))) if float(bid_rate) == int(float(bid_rate)) else str(bid_rate)
+        if chrome.focus_element('#step-rate'):
+            chrome.select_all()
+            time.sleep(0.3)
+            chrome.insert_text(bid_str)
+            time.sleep(0.5)
+            # Tab out to trigger blur/validation
+            chrome.cdp('Input.dispatchKeyEvent', {'type': 'keyDown', 'key': 'Tab', 'code': 'Tab'})
+            chrome.cdp('Input.dispatchKeyEvent', {'type': 'keyUp', 'key': 'Tab', 'code': 'Tab'})
+            log.info(f"  💰 Rate set: ${bid_str}/hr")
+        else:
+            log.warning("  ⚠️  Rate input not found, using default")
     
     time.sleep(1)
 
-    # ── Step 2: Fill cover letter (single visible textarea) ──
+    # ── Step 2: Fill cover letter using CDP Input.insertText ──
     log.info(f"  ✍️  Filling cover letter ({len(cover_letter)} chars)...")
     
-    # Use JSON.parse to safely inject the cover letter text
-    import base64
-    b64_letter = base64.b64encode(cover_letter.encode()).decode()
-    
-    fill_result = chrome.evaluate(f'''
-    (function() {{
-        var textarea = document.querySelector("textarea");
-        if (!textarea) return "NO_TEXTAREA";
-        
-        textarea.focus();
-        textarea.click();
-        
-        // Decode the base64-encoded cover letter
-        var text = atob("{b64_letter}");
-        
-        // Set value using React-compatible native setter
-        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-            window.HTMLTextAreaElement.prototype, "value"
-        ).set;
-        nativeInputValueSetter.call(textarea, text);
-        textarea.dispatchEvent(new Event("input", {{ bubbles: true }}));
-        textarea.dispatchEvent(new Event("change", {{ bubbles: true }}));
-        textarea.dispatchEvent(new Event("blur", {{ bubbles: true }}));
-        return "OK:" + textarea.value.length;
-    }})()
-    ''')
-    log.info(f"  📋 Cover letter result: {fill_result}")
-    
-    if fill_result == 'NO_TEXTAREA':
+    if chrome.focus_element('textarea'):
+        chrome.select_all()
+        time.sleep(0.3)
+        chrome.insert_text(cover_letter)
+        time.sleep(0.5)
+        # Verify
+        fill_result = chrome.evaluate('document.querySelector("textarea")?.value?.length || 0')
+        log.info(f"  📋 Cover letter filled: {fill_result} chars")
+        if not fill_result or fill_result == 0:
+            return False, "Cover letter not filled properly"
+    else:
         return False, "Could not find cover letter textarea"
 
     # Small pause before submit
-    time.sleep(3)
+    time.sleep(2)
 
     # ── Step 3: Click "Send for X Connects" button ──
     log.info("  🚀 Clicking Send...")
