@@ -405,41 +405,105 @@ def submit_proposal_via_cdp(chrome, ciphertext, cover_letter, bid_rate=None):
     # Wait for SPA form to fully render
     time.sleep(5)
 
-    # ── Step 1: Fill bid rate (input#step-rate) using CDP Input ──
+    # Scroll down to form section first
+    chrome.evaluate('window.scrollTo(0, document.body.scrollHeight / 2)')
+    time.sleep(2)
+
+    # ── Step 1: Fill bid rate (input#step-rate) ──
     if bid_rate:
         log.info(f"  💰 Setting bid rate: ${bid_rate}/hr...")
         bid_str = str(int(float(bid_rate))) if float(bid_rate) == int(float(bid_rate)) else str(bid_rate)
-        if chrome.focus_element('#step-rate'):
-            chrome.select_all()
+        # Scroll to rate input
+        chrome.evaluate('var el = document.getElementById("step-rate"); if(el) el.scrollIntoView({block:"center"})')
+        time.sleep(1)
+        # Clear field via native setter, then type via CDP for React compatibility
+        has_rate = chrome.evaluate('''
+        (function() {
+            var el = document.getElementById("step-rate");
+            if (!el) return false;
+            // Clear the input completely using native setter
+            var setter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, "value"
+            ).set;
+            setter.call(el, "");
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+            el.focus();
+            return true;
+        })()
+        ''')
+        if has_rate:
             time.sleep(0.3)
+            # Type the rate value via CDP (triggers React state update)
             chrome.insert_text(bid_str)
             time.sleep(0.5)
             # Tab out to trigger blur/validation
             chrome.cdp('Input.dispatchKeyEvent', {'type': 'keyDown', 'key': 'Tab', 'code': 'Tab'})
             chrome.cdp('Input.dispatchKeyEvent', {'type': 'keyUp', 'key': 'Tab', 'code': 'Tab'})
-            log.info(f"  💰 Rate set: ${bid_str}/hr")
+            rate_val = chrome.evaluate('document.getElementById("step-rate")?.value || "?"')
+            log.info(f"  💰 Rate set: ${rate_val}/hr")
         else:
-            log.warning("  ⚠️  Rate input not found, using default")
+            log.info("  ℹ️  No rate input (fixed-price job)")
     
     time.sleep(1)
 
     # ── Step 2: Fill cover letter using CDP Input.insertText ──
     log.info(f"  ✍️  Filling cover letter ({len(cover_letter)} chars)...")
     
-    if chrome.focus_element('textarea'):
+    # Scroll to textarea
+    chrome.evaluate('var ta = document.querySelector("textarea"); if(ta) ta.scrollIntoView({block:"center"})')
+    time.sleep(1)
+    
+    has_textarea = chrome.evaluate('''
+    (function() {
+        var ta = document.querySelector("textarea");
+        if (!ta) return false;
+        ta.focus();
+        ta.click();
+        ta.select();
+        return true;
+    })()
+    ''')
+    
+    if has_textarea:
+        # Select all and delete existing content
         chrome.select_all()
-        time.sleep(0.3)
+        time.sleep(0.2)
+        chrome.cdp('Input.dispatchKeyEvent', {'type': 'keyDown', 'key': 'Backspace', 'code': 'Backspace'})
+        chrome.cdp('Input.dispatchKeyEvent', {'type': 'keyUp', 'key': 'Backspace', 'code': 'Backspace'})
+        time.sleep(0.2)
+        # Type cover letter via CDP (triggers React state update)
         chrome.insert_text(cover_letter)
-        time.sleep(0.5)
+        time.sleep(1)
         # Verify
-        fill_result = chrome.evaluate('document.querySelector("textarea")?.value?.length || 0')
-        log.info(f"  📋 Cover letter filled: {fill_result} chars")
-        if not fill_result or fill_result == 0:
+        fill_len = chrome.evaluate('document.querySelector("textarea")?.value?.length || 0')
+        log.info(f"  📋 Cover letter filled: {fill_len} chars")
+        if not fill_len or fill_len == 0:
             return False, "Cover letter not filled properly"
     else:
+        # Save debug screenshot
+        try:
+            import base64 as b64mod
+            ss = chrome.cdp('Page.captureScreenshot', {'format': 'png'})
+            if ss.get('data'):
+                with open(os.path.join(SCRIPT_DIR, 'debug_no_textarea.png'), 'wb') as f:
+                    f.write(b64mod.b64decode(ss['data']))
+                log.error("  📸 Debug screenshot: debug_no_textarea.png")
+        except: pass
         return False, "Could not find cover letter textarea"
 
-    # Small pause before submit
+    # Scroll to submit button
+    chrome.evaluate('''
+    (function() {
+        var buttons = document.querySelectorAll("button");
+        for (var i = 0; i < buttons.length; i++) {
+            if (buttons[i].innerText.toLowerCase().includes("send for")) {
+                buttons[i].scrollIntoView({block:"center"});
+                return;
+            }
+        }
+    })()
+    ''')
     time.sleep(2)
 
     # ── Step 3: Click "Send for X Connects" button ──
@@ -475,27 +539,42 @@ def submit_proposal_via_cdp(chrome, ciphertext, cover_letter, bid_rate=None):
         return False, "Could not find Submit button"
 
     # Wait for submission to complete
-    time.sleep(5)
+    time.sleep(8)
 
-    # Check result
+    # Check result — look for actual success indicators
     final_url = chrome.evaluate('window.location.href') or ''
-    final_text = chrome.evaluate('document.body.innerText.substring(0, 1000)') or ''
+    final_text = chrome.evaluate('document.body.innerText.substring(0, 2000)') or ''
     
-    if 'success' in final_text.lower() or 'submitted' in final_text.lower() or 'proposal' in final_url:
+    # Save post-submit screenshot for debugging
+    try:
+        import base64 as b64mod
+        ss = chrome.cdp('Page.captureScreenshot', {'format': 'png'})
+        if ss.get('data'):
+            with open(os.path.join(SCRIPT_DIR, 'debug_post_submit.png'), 'wb') as f:
+                f.write(b64mod.b64decode(ss['data']))
+    except: pass
+
+    # Real success: URL changes away from /apply/ or page shows confirmation
+    if '/apply/' not in final_url:
         return True, "Proposal submitted successfully!"
     
-    # Check for errors
-    errors = chrome.evaluate('''
-        (function() {
-            var errs = document.querySelectorAll('.error, .alert-danger, [role="alert"]');
-            var texts = [];
-            errs.forEach(function(e) { if (e.innerText.trim()) texts.push(e.innerText.trim()); });
-            return texts.join(" | ");
-        })()
-    ''') or ''
+    if 'proposal was submitted' in final_text.lower() or 'your proposal' in final_text.lower():
+        return True, "Proposal submitted successfully!"
     
-    if errors:
-        return False, f"Error: {errors[:200]}"
+    # Still on apply page = likely failed
+    if 'send for' in final_text.lower() and 'connects' in final_text.lower():
+        # Check for validation errors
+        errors = chrome.evaluate('''
+            (function() {
+                var errs = document.querySelectorAll('.error, .alert-danger, [role="alert"], .air3-alert');
+                var texts = [];
+                errs.forEach(function(e) { if (e.innerText.trim()) texts.push(e.innerText.trim()); });
+                return texts.join(" | ");
+            })()
+        ''') or ''
+        if errors:
+            return False, f"Validation error: {errors[:200]}"
+        return False, "Submit clicked but page didn't change — proposal may not have been sent"
     
     return True, f"Submit clicked — verify on Upwork (URL: {final_url[:60]})"
 
