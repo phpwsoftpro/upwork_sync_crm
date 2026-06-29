@@ -485,6 +485,16 @@ def job_to_html(job):
     if client_rows:
         parts.append('<h3>👤 Client</h3><table style="border-collapse:collapse;">' + ''.join(client_rows) + '</table>')
 
+    # Hidden ciphertext for proposal submission
+    cipher = job.get('ciphertext', '')
+    if cipher:
+        parts.append(f'<p style="display:none;" data-ciphertext="{cipher}">CIPHER:{cipher}</p>')
+
+    # Proposal section separator — user writes cover letter below this line
+    parts.append('<hr/>')
+    parts.append('<h3>✍️ PROPOSAL (Write your cover letter below)</h3>')
+    parts.append('<p><em>Write your cover letter here, then add tag "bid:XX" and move to "Send Proposal" stage.</em></p>')
+
     return '\n'.join(parts)
 
 
